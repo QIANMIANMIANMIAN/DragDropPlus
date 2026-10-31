@@ -16,7 +16,7 @@ val appVersionName = versionProps.getProperty("versionName", "1.0.0")
 
 android {
     namespace = "com.vivo.dragdrop.plus"
-    compileSdk = 36
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "com.vivo.dragdrop.plus"
@@ -56,8 +56,11 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
     }
 }
 
