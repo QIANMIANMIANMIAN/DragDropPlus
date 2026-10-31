@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">拖放增强</string>
+    <string name="module_description">让任意应用都能使用超级拖放：长按文字/图片即可跨应用拖走。作用域：拖放直达(com.vivo.globaldragdrop)</string>
+</resources>
