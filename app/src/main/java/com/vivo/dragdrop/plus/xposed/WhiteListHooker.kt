@@ -6,44 +6,41 @@ import java.lang.reflect.Method
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * 核心：强制「拖放白名单」判定通过，让任意 App 都能拖走文字/图片。
+ * 核心：让任意 App 都能拖走文字/图片。
  *
- * ================== 打点依据（实机反编译 拖放直达 4.1.0.0 得出）==================
+ * ================= 1.0.2 关键修正：打点换到真正的位置 =================
  *
- * 判定链：
+ * 1.0.0 / 1.0.1 hook 的是 WhiteListResultBean.getResult()，
+ * 日志显示 hook 成功挂上，但一条「放行」都没打印 —— 说明那个方法根本没被调用。
  *
- *   za.n.p(...)                                    ← 拖放调度协程（R8 混淆名）
- *     └── EnhancedDragWhiteList$Companion.checkWhiteList(...) -> WhiteListResultBean
- *           └── IConfigListStrategy.executionStrategy(...)    ← 具体策略
- *                 ├── BlackListStrategy
- *                 ├── WhiteListStrategy  (内部再分 Strict / UnStrict)
- *                 └── NoWidgetLimitWhiteListStrategy
+ * 重新静态分析后发现：WhiteListResultBean.getResult() 在整个 dex 里只有 2 处调用，
+ * 都在 za.n 里，而 za.n 属于【中转岛 TransIsland】链路（gb.e = IslandStrategy），
+ * 跟「长按拖拽」是两条不同的路。所以之前打错了地方。
  *
- * 调用点 za.n 的 smali（原样）：
+ * ================== 真正的拦截点 ==================
  *
- *     invoke-static/range {v12 .. v22}, ...->checkWhiteList$default(...)Lcom/vivo/common/dragdrop/data/bean/WhiteListResultBean;
- *     move-result-object v0
- *     invoke-virtual {v0}, ...->getResult()Z
- *     move-result v3
- *     if-nez v3, :cond_616          # result==false
- *     invoke-virtual {v0}, ...->getBlackResult()Z
- *     move-result v3
- *     if-eqz v3, :cond_600          # blackResult==false -> 不通过
- *     goto :goto_616                # blackResult==true  -> 通过
- *   :cond_600                        # 继续尝试下一个候选控件
+ * 拖拽起始消息由 DragService 的 Handler（cb.h）处理，其 a(Message) 方法里：
  *
- * 结论：只要 getResult() 恒返回 true，白名单判定必然通过。
+ *     .line 1597
+ *     invoke-static {v2, v3}, Lza/o;->g(Ljava/lang/String;Ljava/lang/String;)Z
+ *     move-result v2
+ *     .line 1601
+ *     if-nez v2, :cond_6a9              # ← 返回 false 就进拒绝分支
+ *     .line 1613
+ *     const-string v5, "activity not in whitelist: "     # ← 拒绝日志
+ *     .line 1626
+ *     const/16 v5, 0x1b                 # ← 给客户端回 what=27（拒绝）
  *
- * ================== 1.0.1 修复：类加载器 ==================
- * 1.0.0 用 `Class.forName(name)` 定位类，日志报「找不到 WhiteListResultBean」。
- * 原因：Class.forName 单参重载用的是【本模块自己的 ClassLoader】，
- *       而 WhiteListResultBean 在【宿主 App 的 ClassLoader】里，
- *       两者是互相隔离的 PathClassLoader，所以永远找不到。
- * 修复：改用 `PackageLoadedParam.getDefaultClassLoader()`（libxposed 102 API）
- *       作为宿主 ClassLoader，并通过 `Class.forName(name, false, cl)` 加载。
+ * 即：za.o.g(packageName, activityName) 返回 false → 拖拽被直接拒绝。
+ * 整个 dex 里这个方法【只有这一个调用点】，hook 它零副作用。
  *
- * 同时保留反射兜底：若宿主 ClassLoader 也拿不到，再从
- * ActivityThread.currentApplication().getClassLoader() 取。
+ * za.o.g 原始逻辑（反编译确认）：
+ *     pkg 为空 / activity 为空 / activity == "NA"  → false
+ *     查 EnhancedDragFeatureListV2[pkg] 的 pages，比对 activity
+ *     查 EnhancedDragWhiteListV2[pkg]
+ *     两个都查不到 → false
+ *
+ * 所以恒返回 true 就等于「所有 App 的所有页面都在白名单里」。
  */
 internal class WhiteListHooker(
     private val module: XposedModule,
@@ -54,53 +51,57 @@ internal class WhiteListHooker(
 ) {
 
     private companion object {
-        const val TAG = "[WhiteList]"
+        const val TAG = "[DragPlus]"
 
-        /** 白名单结果 Bean（R8 混淆后仍在原包名下，未改名 —— 已用 dex_names 核实） */
-        const val CLS_RESULT_BEAN =
+        /**
+         * 白名单总闸门（R8 混淆名，但混淆后类名是确定的）：
+         *   za.o.g(String packageName, String activityName) : boolean
+         */
+        const val CLS_GATE = "za.o"
+
+        /** 主判定方法：按包名+Activity 判断能否拖 */
+        const val METHOD_CHECK = "g"
+
+        /** 用于确认环境：拖拽起始消息 Handler */
+        const val CLS_HANDLER = "cb.h"
+
+        /** 用于确认环境：中转岛白名单 bean（存在说明是拖放进程） */
+        const val CLS_WL_BEAN =
             "com.vivo.common.dragdrop.data.bean.WhiteListResultBean"
 
-        /** 白名单总入口（Companion 单例） */
-        const val CLS_WL_COMPANION =
-            "com.vivo.common.dragdrop.data.bean.EnhancedDragWhiteList\$Companion"
-
-        /** 调度类，用于确认进程环境（不存在说明不是拖放进程） */
-        const val CLS_DISPATCH = "za.n"
-
-        const val METHOD_GET_RESULT = "getResult"
-
         /** 打点日志限流：前 N 次全打，之后每 M 次打一条 */
-        const val LOG_FIRST = 20
+        const val LOG_FIRST = 30
         const val LOG_EVERY = 200
     }
 
     private val hitCount = AtomicInteger(0)
-    private val appliedCount = AtomicInteger(0)
+    private val passCount = AtomicInteger(0)
 
     fun install() {
         ModLog.i("$TAG ClassLoader=${hostClassLoader.javaClass.name}")
 
-        val beanCls = loadClass(CLS_RESULT_BEAN)
-        if (beanCls == null) {
-            // 类加载失败时，把诊断信息打全，方便判断是「进程不对」还是「版本改名」
+        val gateCls = loadClass(CLS_GATE)
+        if (gateCls == null) {
             dumpDiagnostics()
             return
         }
 
-        val dispatchPresent = loadClass(CLS_DISPATCH) != null
-        val companionPresent = loadClass(CLS_WL_COMPANION) != null
         ModLog.i(
-            "$TAG 环境：bean=${beanCls.name} dispatch=$dispatchPresent companion=$companionPresent",
+            "$TAG 环境：gate=${gateCls.name} handler=${loadClass(CLS_HANDLER) != null} " +
+                "bean=${loadClass(CLS_WL_BEAN) != null}",
         )
 
-        hookGetResult(beanCls)
+        hookGate(gateCls)
     }
 
-    private fun hookGetResult(beanCls: Class<*>) {
-        val method = findGetResult(beanCls)
+    private fun hookGate(gateCls: Class<*>) {
+        val method = findGate(gateCls)
         if (method == null) {
-            ModLog.w("$TAG 找不到 $METHOD_GET_RESULT()，该类方法：" +
-                beanCls.declaredMethods.joinToString { it.name }.take(400))
+            ModLog.w(
+                "$TAG 找不到 $CLS_GATE.$METHOD_CHECK(String,String)Z，该类方法：" +
+                    gateCls.declaredMethods.joinToString { "${it.name}(${it.parameterCount})" }
+                        .take(500),
+            )
             return
         }
         ModLog.i("$TAG 目标方法：${method.toGenericString()}")
@@ -109,60 +110,62 @@ internal class WhiteListHooker(
             module.hook(method)
                 .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
                 .intercept { chain ->
-                    if (!forceAllProvider()) {
-                        return@intercept chain.proceed()
-                    }
-                    val n = hitCount.incrementAndGet()
+                    val pkg = chain.args.getOrNull(0) as? String
+                    val act = chain.args.getOrNull(1) as? String
 
-                    // 走到这里说明 vivo 已经完成了一轮白名单判定，
-                    // 并把结论写进了这个 bean。我们只把结论翻成 true。
+                    // 关掉开关 → 完全走原生逻辑
+                    if (!forceAllProvider()) {
+                        val r = runCatching { chain.proceed() as? Boolean ?: false }
+                            .getOrDefault(false)
+                        log(pkg, act, r, r)
+                        return@intercept r
+                    }
+
                     val original = runCatching { chain.proceed() as? Boolean ?: false }
                         .getOrDefault(false)
 
-                    if (n <= LOG_FIRST || n % LOG_EVERY == 0) {
-                        val info = describe(chain.thisObject)
-                        ModLog.i("$TAG 放行 #$n 原结论=$original $info")
-                    }
-
-                    if (!original) appliedCount.incrementAndGet()
-
-                    // ★ 无论原值如何，一律返回 true
+                    // ★ 恒返回 true：任何 App 的任何 Activity 都算在白名单里
+                    log(pkg, act, original, true)
+                    if (!original) passCount.incrementAndGet()
                     true
                 }
-            ModLog.i("$TAG ✅ 已 hook ${beanCls.simpleName}.$METHOD_GET_RESULT()")
+            ModLog.i("$TAG ✅ 已 hook ${gateCls.name}.$METHOD_CHECK —— 任意 App 可拖")
         }.onFailure {
-            ModLog.e("$TAG 挂载 $METHOD_GET_RESULT 失败", it)
+            ModLog.e("$TAG 挂载 $METHOD_CHECK 失败", it)
         }
     }
 
-    /** 找 getResult()Z：先按名字精确找无参 boolean，再退化到按名字找 */
-    private fun findGetResult(cls: Class<*>): Method? {
-        runCatching {
-            cls.getDeclaredMethod(METHOD_GET_RESULT).let {
-                if (it.returnType == Boolean::class.javaPrimitiveType ||
-                    it.returnType == java.lang.Boolean::class.java
-                ) {
-                    return it
-                }
-            }
-        }
-        return runCatching {
-            cls.declaredMethods.firstOrNull {
-                it.name == METHOD_GET_RESULT && it.parameterCount == 0
-            }
-        }.getOrNull()
+    private fun log(pkg: String?, act: String?, original: Boolean, result: Boolean) {
+        val n = hitCount.incrementAndGet()
+        if (n > LOG_FIRST && n % LOG_EVERY != 0) return
+        val mark = if (result && !original) "强行放行" else if (result) "原生通过" else "原生拒绝"
+        ModLog.i("$TAG #$n $mark pkg=$pkg activity=$act original=$original → $result")
     }
 
     /**
-     * 类加载失败时输出诊断，区分三种情况：
-     *  1. 宿主 ClassLoader 里根本没有这个包 → 进程/包名不对
-     *  2. 有包但没有这个类 → 版本改名（R8 混淆策略变化）
-     *  3. ClassLoader 本身拿错 → 打印 loader 层级
+     * 精确找 g(String,String)Z。
+     * 只按「名字 g + 两个 String 参数 + 返回 boolean」定位，
+     * 不做名字模糊匹配，避免挂到别的重载上。
+     */
+    private fun findGate(cls: Class<*>): Method? = runCatching {
+        cls.declaredMethods.firstOrNull {
+            it.name == METHOD_CHECK &&
+                it.parameterCount == 2 &&
+                it.parameterTypes[0] == String::class.java &&
+                it.parameterTypes[1] == String::class.java &&
+                (it.returnType == Boolean::class.javaPrimitiveType ||
+                    it.returnType == java.lang.Boolean::class.java)
+        }?.also { it.isAccessible = true }
+    }.getOrNull()
+
+    /**
+     * 类加载失败时输出诊断，区分：
+     *  1. 宿主 ClassLoader 里根本没有这个类 → 版本改名
+     *  2. loader 用错
      */
     private fun dumpDiagnostics() {
-        ModLog.w("$TAG ❌ 加载不到 $CLS_RESULT_BEAN")
+        ModLog.w("$TAG ❌ 加载不到 $CLS_GATE")
 
-        // 试同名类在别的 loader 里能不能找到（判断是不是 loader 用错）
         val altLoaders = listOfNotNull(
             "currentThread" to Thread.currentThread().contextClassLoader,
             "thisObj" to javaClass.classLoader,
@@ -172,58 +175,27 @@ internal class WhiteListHooker(
                 ModLog.w("$TAG    loader[$tag]=null")
                 continue
             }
-            val found = runCatching { Class.forName(CLS_RESULT_BEAN, false, cl) }.isSuccess
+            val found = runCatching { Class.forName(CLS_GATE, false, cl) }.isSuccess
             ModLog.w("$TAG    loader[$tag]=${cl.javaClass.name} found=$found")
         }
 
-        // 宿主 loader 里能不能找到同包下的其它类（说明包加载了但类改名）
+        // 已知同包兄弟类，用于判断「只是改名」还是「整个版本结构变了」
         val siblings = listOf(
+            CLS_HANDLER,
+            CLS_WL_BEAN,
             "com.vivo.common.dragdrop.data.bean.EnhancedDragWhiteList",
-            "com.vivo.common.dragdrop.data.bean.WhiteListStrategy",
-            "com.vivo.common.dragdrop.data.bean.StrictModeWhiteListStrategy",
+            "com.vivo.common.dragdrop.data.bean.WhiteListResultBean",
+            "com.vivo.dragdrop.service.DragService",
         )
         for (s in siblings) {
             ModLog.w("$TAG    兄弟类 $s = ${loadClass(s) != null}")
-        }
-
-        // 兜底：扫一遍 dex 里 data.bean 包下所有类名，直接看真实类名
-        runCatching {
-            val dexCls = loadClass("dalvik.system.BaseDexClassLoader")
-            if (dexCls != null && dexCls.isInstance(hostClassLoader)) {
-                ModLog.w("$TAG    hostClassLoader 是 BaseDexClassLoader，可枚举 dex")
-            }
         }
     }
 
     /**
      * 用【宿主 ClassLoader】加载类。
-     * 注意 initialize=false：此时只做 hook 目标定位，不要触发静态初始化。
+     * initialize=false：只做 hook 目标定位，不要触发静态初始化。
      */
     private fun loadClass(name: String): Class<*>? =
         runCatching { Class.forName(name, false, hostClassLoader) }.getOrNull()
-
-    /**
-     * 把 WhiteListResultBean 的关键字段读出来，方便日后定位哪些 App 是被我们强行放行的。
-     * 全部走反射且容错，读不到就跳过。
-     */
-    private fun describe(bean: Any?): String {
-        if (bean == null) return "bean=null"
-        return runCatching {
-            val c = bean.javaClass
-            val sb = StringBuilder()
-            sb.append("type=").append(readStr(bean, c, "type"))
-            sb.append(", result=").append(readStr(bean, c, "result"))
-            sb.append(", black=").append(readStr(bean, c, "blackResult"))
-            sb.append(", strict=").append(readStr(bean, c, "strictModel"))
-            sb.append(", imgFmt=").append(readStr(bean, c, "imageFormat"))
-            sb.toString()
-        }.getOrDefault("bean=<读字段失败>")
-    }
-
-    /** 读一个字段并转字符串；字段不存在或读失败返回 "?" */
-    private fun readStr(obj: Any, cls: Class<*>, name: String): String =
-        runCatching {
-            val f = cls.getDeclaredField(name).apply { isAccessible = true }
-            f.get(obj)?.toString() ?: "null"
-        }.getOrDefault("?")
 }
