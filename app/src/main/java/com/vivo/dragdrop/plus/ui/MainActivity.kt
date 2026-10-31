@@ -37,7 +37,6 @@ private const val KEY_FORCE_ALL = "force_all"
 private const val KEY_RELAX_IMAGE = "relax_image"
 private const val KEY_DEBUG_LOG = "debug_log"
 
-private const val LOG_PATH = "/sdcard/Documents/DragDropPlus/module.log"
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -150,36 +149,16 @@ private fun LogCard() {
     var content by remember { mutableStateOf("") }
     var source by remember { mutableStateOf("") }
     var loading by remember { mutableStateOf(false) }
-    var pendingSource by remember { mutableStateOf("") }
 
     val scope = rememberCoroutineScope()
 
     fun refresh() {
         loading = true
-        // 读 logcat 是阻塞 IO，不能放主线程
         scope.launch(Dispatchers.IO) {
-            val result = buildString {
-                // 1) 优先读公共目录日志文件（需要「所有文件访问」权限）
-                val f = File(LOG_PATH)
-                if (f.exists() && f.canRead()) {
-                    val body = runCatching { f.readText().takeLast(12000) }.getOrDefault("")
-                    if (body.isNotBlank()) {
-                        append("【文件】").append(LOG_PATH).append("\n")
-                        append("─".repeat(28)).append("\n")
-                        append(body)
-                        pendingSource = "文件"
-                        return@buildString
-                    }
-                }
-                // 2) 文件读不到 → 走 logcat（不需要任何权限）
-                append("【logcat】tag=DragDropPlus\n")
-                append("─".repeat(28)).append("\n")
-                append(readLogcat())
-                pendingSource = "logcat"
-            }
+            val (src, text) = loadLog()
             withContext(Dispatchers.Main) {
-                content = result.ifBlank { "（没有日志）" }
-                source = pendingSource
+                source = src
+                content = text.ifBlank { "（没有日志）" }
                 loading = false
             }
         }
@@ -243,14 +222,71 @@ private fun LogCard() {
     }
 }
 
-/** 读 logcat 里本模块的输出（不需要权限） */
+/**
+ * 日志候选路径，按「管理器能否读到」排序。
+ *
+ * 模块跑在目标进程 com.vivo.globaldragdrop 里，日志写在目标 App 的外部私有目录：
+ *   /storage/emulated/0/Android/data/com.vivo.globaldragdrop/files/DragDropPlus/module.log
+ * 管理器要读它需要「所有文件访问」；没授权时用 root su 兜底。
+ */
+private val LOG_CANDIDATES = listOf(
+    "/storage/emulated/0/Android/data/com.vivo.globaldragdrop/files/DragDropPlus/module.log",
+    "/sdcard/Android/data/com.vivo.globaldragdrop/files/DragDropPlus/module.log",
+    "/sdcard/Documents/DragDropPlus/module.log",
+    "/sdcard/Download/DragDropPlus/module.log",
+)
+
+/** 依次尝试：直接读 → root 读 → logcat */
+private fun loadLog(): Pair<String, String> {
+    // 1) 直接读（需要 MANAGE_EXTERNAL_STORAGE）
+    for (path in LOG_CANDIDATES) {
+        val f = File(path)
+        if (f.exists() && f.canRead()) {
+            val body = runCatching { f.readText().takeLast(15000) }.getOrDefault("")
+            if (body.isNotBlank()) return "文件" to "【$path】\n${"-".repeat(30)}\n$body"
+        }
+    }
+    // 2) root 读（模块里写的位置管理器可能没权限，su 一定行）
+    for (path in LOG_CANDIDATES) {
+        val body = suCat(path)
+        if (!body.isNullOrBlank()) {
+            return "root" to "【$path】（root 读取）\n${"-".repeat(30)}\n$body"
+        }
+    }
+    // 3) logcat 兜底（普通 App 只能读自己 uid 的日志，
+    //    但 root 下可以读全量，所以这里也先试 root logcat）
+    val lc = suLogcat() ?: readLogcat()
+    return "logcat" to "【logcat】tag=DragDropPlus\n${"-".repeat(30)}\n$lc"
+}
+
+/** su -c cat 读文件；失败返回 null */
+private fun suCat(path: String): String? = runCatching {
+    val p = ProcessBuilder("su", "-c", "cat '$path'")
+        .redirectErrorStream(true)
+        .start()
+    val out = p.inputStream.bufferedReader().readText()
+    p.waitFor()
+    out.takeIf { it.isNotBlank() && !it.contains("No such file") && !it.contains("Permission denied") }
+        ?.takeLast(15000)
+}.getOrNull()
+
+/** su -c logcat 读目标进程日志 */
+private fun suLogcat(): String? = runCatching {
+    val p = ProcessBuilder("su", "-c", "logcat -d -t 4000 -s DragDropPlus:V")
+        .redirectErrorStream(true)
+        .start()
+    val out = p.inputStream.bufferedReader().readText()
+    p.waitFor()
+    out.takeIf { it.isNotBlank() && !it.contains("Permission denied") }?.takeLast(15000)
+}.getOrNull()
+
+/** 读 logcat 里本模块的输出（只能拿到自己 uid 的） */
 private fun readLogcat(): String = runCatching {
     val p = ProcessBuilder("logcat", "-d", "-t", "3000", "-s", "DragDropPlus:V")
         .redirectErrorStream(true)
         .start()
     val out = p.inputStream.bufferedReader().readText()
     p.waitFor()
-    // 只保留最近 8000 字符，避免超大
     out.takeLast(8000).ifBlank { "（logcat 里暂无 DragDropPlus 输出）" }
 }.getOrDefault("（读 logcat 失败）")
 

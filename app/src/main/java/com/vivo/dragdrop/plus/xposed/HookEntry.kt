@@ -43,6 +43,13 @@ class HookEntry : XposedModule() {
          */
         private const val LOG_FILE = "module.log"
         private const val LOG_MAX_BYTES = 512L * 1024
+
+        /**
+         * 目标 App 的外部私有目录。硬编码而不走 API，
+         * 是为了在没有 Context 时也能尝试。
+         */
+        private const val EXTERNAL_APP_DIR =
+            "/storage/emulated/0/Android/data/com.vivo.globaldragdrop/files/DragDropPlus"
     }
 
     private val prefs: SharedPreferences by lazy { getRemotePreferences(PREFS_NAME) }
@@ -120,30 +127,30 @@ class HookEntry : XposedModule() {
     /**
      * 日志落盘。
      *
-     * 关键：目标进程里没有 Context 可用时，用宿主 ClassLoader 反射拿
-     * ActivityThread.currentApplication()；拿到后写它自己的私有目录
-     * （=/data/data/com.vivo.globaldragdrop/files/DragDropPlus/module.log）。
+     * ============ 1.0.3 修正：日志必须写到「两边都可达」的位置 ============
      *
-     * 但管理器 App 读不到别的 App 的私有目录 —— 所以再尝试写一份到公共目录。
-     * 公共目录不可写就算了，UI 会提示去 logcat 看。
+     * 模块代码跑在【目标进程 com.vivo.globaldragdrop】里，用的是目标 App 的权限。
+     * 1.0.1/1.0.2 首选写 app.filesDir，那是
+     *   /data/data/com.vivo.globaldragdrop/files/DragDropPlus
+     * —— 目标 App 私有目录，管理器 App（不同 uid）永远读不到，所以 UI 一片空白。
+     *
+     * 现在改为：目标 App 的【外部】私有目录
+     *   /storage/emulated/0/Android/data/com.vivo.globaldragdrop/files/DragDropPlus
+     *  - 目标进程：这是它自己的外部目录，无需任何权限，必定可写
+     *  - 管理器：授予 MANAGE_EXTERNAL_STORAGE 后可读；有 root 时用 su 直接 cat
+     *
+     * 同时保留 /sdcard/Documents/DragDropPlus 作为副本（能写就写）。
      */
     private fun installFileLog(hostCl: ClassLoader) {
         runCatching {
             val app = currentApplication(hostCl)
-            val dir = pickLogDir(app)
-            if (dir == null) {
+
+            val file = chooseLogFile(app)
+            if (file == null) {
                 ModLog.w("没有可写日志目录，只输出 logcat")
                 return
             }
-            if (!dir.exists()) dir.mkdirs()
-            if (!dir.canWrite()) {
-                ModLog.w("日志目录不可写：${dir.absolutePath}")
-                return
-            }
-            val file = File(dir, LOG_FILE)
-            if (file.exists() && file.length() > LOG_MAX_BYTES) file.delete()
 
-            // 公共目录副本（能写就写，写不了静默放弃）
             val mirror = runCatching {
                 val d = File("/sdcard/Documents/DragDropPlus")
                 if (!d.exists()) d.mkdirs()
@@ -162,18 +169,35 @@ class HookEntry : XposedModule() {
         }
     }
 
-    private fun pickLogDir(app: Context?): File? {
-        if (app != null) {
-            runCatching {
-                return File(app.filesDir, "DragDropPlus")
-            }
+    /** 依次尝试几个候选位置，返回第一个真正可写的文件 */
+    private fun chooseLogFile(app: Context?): File? {
+        val candidates = mutableListOf<File>()
+
+        // 1) 目标 App 的外部私有目录（管理器授权后可读，目标进程必定可写）
+        runCatching { app?.getExternalFilesDir(null) }.getOrNull()?.let {
+            candidates += File(it, "DragDropPlus/$LOG_FILE")
         }
-        // 没有 Context：退到外部公共目录（模块自身无存储权限，可能失败）
-        return runCatching {
-            val d = File("/sdcard/Documents/DragDropPlus")
-            if (!d.exists()) d.mkdirs()
-            d.takeIf { it.canWrite() }
-        }.getOrNull()
+        // 2) 硬编码路径兜底（拿不到 Context 时也能试）
+        candidates += File("$EXTERNAL_APP_DIR/$LOG_FILE")
+        // 3) 目标 App 内部私有目录（管理器读不到，但日志不丢，可用 root 取）
+        runCatching { app?.filesDir }.getOrNull()?.let {
+            candidates += File(it, "DragDropPlus/$LOG_FILE")
+        }
+        // 4) 公共目录
+        candidates += File("/sdcard/Documents/DragDropPlus/$LOG_FILE")
+        candidates += File("/sdcard/Download/DragDropPlus/$LOG_FILE")
+
+        for (f in candidates) {
+            val ok = runCatching {
+                f.parentFile?.let { if (!it.exists()) it.mkdirs() }
+                if (f.parentFile?.canWrite() != true) return@runCatching false
+                if (f.exists() && f.length() > LOG_MAX_BYTES) f.delete()
+                f.appendText("")
+                f.canWrite()
+            }.getOrDefault(false)
+            if (ok) return f
+        }
+        return null
     }
 
     /** 用宿主 ClassLoader 反射取 Application Context（目标进程里没有别的办法拿到） */
