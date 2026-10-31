@@ -48,9 +48,6 @@ jobs:
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
           echo "版本：$NAME ($CODE)"
 
-      - name: Generate Gradle wrapper
-        run: gradle wrapper --gradle-version 8.13 --distribution-type bin
-
       - name: Build release
         run: |
           echo "sdk.dir=$ANDROID_HOME" > local.properties
