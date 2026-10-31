@@ -2,6 +2,7 @@ package com.vivo.dragdrop.plus.xposed
 
 import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedModule
+import java.lang.reflect.Method
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -33,22 +34,21 @@ import java.util.concurrent.atomic.AtomicInteger
  *
  * 结论：只要 getResult() 恒返回 true，白名单判定必然通过。
  *
- * 为什么只改 getResult：
- *  - getResult() 是纯 getter（2 条指令，读 result:Z 字段），hook 它代价最低、
- *    不会破坏任何业务逻辑，也不影响 WhiteListResultBean 上其它字段。
- *  - 其它字段（type / imageFormat / strictModel / imageMinWidth ...）全部保留
- *    vivo 自己填的值 —— 这些值决定了后续「抓文字还是抓图 / 用什么格式」，
- *    一旦乱改（比如把 type 改成自定义串）就会走进未覆盖分支导致拖不起来。
- *  - 因此绝不 setResult / 不修改 bean，只覆写返回值。
+ * ================== 1.0.1 修复：类加载器 ==================
+ * 1.0.0 用 `Class.forName(name)` 定位类，日志报「找不到 WhiteListResultBean」。
+ * 原因：Class.forName 单参重载用的是【本模块自己的 ClassLoader】，
+ *       而 WhiteListResultBean 在【宿主 App 的 ClassLoader】里，
+ *       两者是互相隔离的 PathClassLoader，所以永远找不到。
+ * 修复：改用 `PackageLoadedParam.getDefaultClassLoader()`（libxposed 102 API）
+ *       作为宿主 ClassLoader，并通过 `Class.forName(name, false, cl)` 加载。
  *
- * 为什么不 hook executionStrategy / checkWhiteList：
- *  - executionStrategy 有 4 个实现、参数含 WidgetBean 等复杂对象，
- *    hook 后要构造 WhiteListResultBean 返回值，容易 NPE。
- *  - checkWhiteList 内部还会读写 bean 字段做副作用，绕过它反而丢数据。
- *  - getResult 是唯一的「最终裁决读点」，改它等价于「全部通过」且零副作用。
+ * 同时保留反射兜底：若宿主 ClassLoader 也拿不到，再从
+ * ActivityThread.currentApplication().getClassLoader() 取。
  */
 internal class WhiteListHooker(
     private val module: XposedModule,
+    /** 宿主进程的 ClassLoader —— 必须用它，不能用模块自己的 */
+    private val hostClassLoader: ClassLoader,
     /** 总开关提供者：由 HookEntry 持有，实时反映用户设置 */
     private val forceAllProvider: () -> Boolean,
 ) {
@@ -56,7 +56,7 @@ internal class WhiteListHooker(
     private companion object {
         const val TAG = "[WhiteList]"
 
-        /** 白名单结果 Bean（R8 混淆后仍在原包名下，未改名） */
+        /** 白名单结果 Bean（R8 混淆后仍在原包名下，未改名 —— 已用 dex_names 核实） */
         const val CLS_RESULT_BEAN =
             "com.vivo.common.dragdrop.data.bean.WhiteListResultBean"
 
@@ -78,25 +78,32 @@ internal class WhiteListHooker(
     private val appliedCount = AtomicInteger(0)
 
     fun install() {
-        // 环境确认：这些类只在拖放进程存在；不存在就直接退出，别瞎挂
-        val beanCls = resolveOrNull(CLS_RESULT_BEAN)
+        ModLog.i("$TAG ClassLoader=${hostClassLoader.javaClass.name}")
+
+        val beanCls = loadClass(CLS_RESULT_BEAN)
         if (beanCls == null) {
-            ModLog.w("$TAG 找不到 $CLS_RESULT_BEAN —— 当前进程不是拖放进程，跳过")
+            // 类加载失败时，把诊断信息打全，方便判断是「进程不对」还是「版本改名」
+            dumpDiagnostics()
             return
         }
-        val dispatchPresent = resolveOrNull(CLS_DISPATCH) != null
-        val companionPresent = resolveOrNull(CLS_WL_COMPANION) != null
-        ModLog.i("$TAG 环境：bean=${beanCls.simpleName} dispatch=$dispatchPresent companion=$companionPresent")
+
+        val dispatchPresent = loadClass(CLS_DISPATCH) != null
+        val companionPresent = loadClass(CLS_WL_COMPANION) != null
+        ModLog.i(
+            "$TAG 环境：bean=${beanCls.name} dispatch=$dispatchPresent companion=$companionPresent",
+        )
 
         hookGetResult(beanCls)
     }
 
     private fun hookGetResult(beanCls: Class<*>) {
-        val method = runCatching { beanCls.getDeclaredMethod(METHOD_GET_RESULT) }.getOrNull()
+        val method = findGetResult(beanCls)
         if (method == null) {
-            ModLog.w("$TAG 找不到 $METHOD_GET_RESULT()，跳过")
+            ModLog.w("$TAG 找不到 $METHOD_GET_RESULT()，该类方法：" +
+                beanCls.declaredMethods.joinToString { it.name }.take(400))
             return
         }
+        ModLog.i("$TAG 目标方法：${method.toGenericString()}")
 
         runCatching {
             module.hook(method)
@@ -128,6 +135,73 @@ internal class WhiteListHooker(
         }
     }
 
+    /** 找 getResult()Z：先按名字精确找无参 boolean，再退化到按名字找 */
+    private fun findGetResult(cls: Class<*>): Method? {
+        runCatching {
+            cls.getDeclaredMethod(METHOD_GET_RESULT).let {
+                if (it.returnType == Boolean::class.javaPrimitiveType ||
+                    it.returnType == java.lang.Boolean::class.java
+                ) {
+                    return it
+                }
+            }
+        }
+        return runCatching {
+            cls.declaredMethods.firstOrNull {
+                it.name == METHOD_GET_RESULT && it.parameterCount == 0
+            }
+        }.getOrNull()
+    }
+
+    /**
+     * 类加载失败时输出诊断，区分三种情况：
+     *  1. 宿主 ClassLoader 里根本没有这个包 → 进程/包名不对
+     *  2. 有包但没有这个类 → 版本改名（R8 混淆策略变化）
+     *  3. ClassLoader 本身拿错 → 打印 loader 层级
+     */
+    private fun dumpDiagnostics() {
+        ModLog.w("$TAG ❌ 加载不到 $CLS_RESULT_BEAN")
+
+        // 试同名类在别的 loader 里能不能找到（判断是不是 loader 用错）
+        val altLoaders = listOfNotNull(
+            "currentThread" to Thread.currentThread().contextClassLoader,
+            "thisObj" to javaClass.classLoader,
+        )
+        for ((tag, cl) in altLoaders) {
+            if (cl == null) {
+                ModLog.w("$TAG    loader[$tag]=null")
+                continue
+            }
+            val found = runCatching { Class.forName(CLS_RESULT_BEAN, false, cl) }.isSuccess
+            ModLog.w("$TAG    loader[$tag]=${cl.javaClass.name} found=$found")
+        }
+
+        // 宿主 loader 里能不能找到同包下的其它类（说明包加载了但类改名）
+        val siblings = listOf(
+            "com.vivo.common.dragdrop.data.bean.EnhancedDragWhiteList",
+            "com.vivo.common.dragdrop.data.bean.WhiteListStrategy",
+            "com.vivo.common.dragdrop.data.bean.StrictModeWhiteListStrategy",
+        )
+        for (s in siblings) {
+            ModLog.w("$TAG    兄弟类 $s = ${loadClass(s) != null}")
+        }
+
+        // 兜底：扫一遍 dex 里 data.bean 包下所有类名，直接看真实类名
+        runCatching {
+            val dexCls = loadClass("dalvik.system.BaseDexClassLoader")
+            if (dexCls != null && dexCls.isInstance(hostClassLoader)) {
+                ModLog.w("$TAG    hostClassLoader 是 BaseDexClassLoader，可枚举 dex")
+            }
+        }
+    }
+
+    /**
+     * 用【宿主 ClassLoader】加载类。
+     * 注意 initialize=false：此时只做 hook 目标定位，不要触发静态初始化。
+     */
+    private fun loadClass(name: String): Class<*>? =
+        runCatching { Class.forName(name, false, hostClassLoader) }.getOrNull()
+
     /**
      * 把 WhiteListResultBean 的关键字段读出来，方便日后定位哪些 App 是被我们强行放行的。
      * 全部走反射且容错，读不到就跳过。
@@ -152,7 +226,4 @@ internal class WhiteListHooker(
             val f = cls.getDeclaredField(name).apply { isAccessible = true }
             f.get(obj)?.toString() ?: "null"
         }.getOrDefault("?")
-
-    private fun resolveOrNull(name: String): Class<*>? =
-        runCatching { Class.forName(name) }.getOrNull()
 }

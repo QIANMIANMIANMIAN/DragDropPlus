@@ -2,6 +2,7 @@ package com.vivo.dragdrop.plus.ui
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -25,6 +26,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.vivo.dragdrop.plus.BuildConfig
 import java.io.File
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
 
 /** 与模块侧 HookEntry 保持一致的 key */
 private const val PREFS_NAME = "dragdrop_plus"
@@ -141,16 +146,42 @@ private fun MainScreen() {
 
 @Composable
 private fun LogCard() {
+    val ctx = LocalContext.current
     var content by remember { mutableStateOf("") }
-    var exists by remember { mutableStateOf(false) }
+    var source by remember { mutableStateOf("") }
+    var loading by remember { mutableStateOf(false) }
+    var pendingSource by remember { mutableStateOf("") }
+
+    val scope = rememberCoroutineScope()
 
     fun refresh() {
-        val f = File(LOG_PATH)
-        exists = f.exists()
-        content = if (exists) {
-            runCatching { f.readText().takeLast(8000) }.getOrDefault("<读取失败>")
-        } else {
-            "日志文件尚未生成：\n$LOG_PATH\n\n（需要模块在拖放进程里被加载后才会写入）"
+        loading = true
+        // 读 logcat 是阻塞 IO，不能放主线程
+        scope.launch(Dispatchers.IO) {
+            val result = buildString {
+                // 1) 优先读公共目录日志文件（需要「所有文件访问」权限）
+                val f = File(LOG_PATH)
+                if (f.exists() && f.canRead()) {
+                    val body = runCatching { f.readText().takeLast(12000) }.getOrDefault("")
+                    if (body.isNotBlank()) {
+                        append("【文件】").append(LOG_PATH).append("\n")
+                        append("─".repeat(28)).append("\n")
+                        append(body)
+                        pendingSource = "文件"
+                        return@buildString
+                    }
+                }
+                // 2) 文件读不到 → 走 logcat（不需要任何权限）
+                append("【logcat】tag=DragDropPlus\n")
+                append("─".repeat(28)).append("\n")
+                append(readLogcat())
+                pendingSource = "logcat"
+            }
+            withContext(Dispatchers.Main) {
+                content = result.ifBlank { "（没有日志）" }
+                source = pendingSource
+                loading = false
+            }
         }
     }
 
@@ -163,25 +194,89 @@ private fun LogCard() {
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text("运行日志", fontWeight = FontWeight.SemiBold)
-                TextButton(onClick = { refresh() }) { Text("刷新") }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("运行日志", fontWeight = FontWeight.SemiBold)
+                    if (source.isNotEmpty()) {
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            "($source)",
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                Row {
+                    if (!hasAllFilesAccess(ctx)) {
+                        TextButton(onClick = { requestAllFilesAccess(ctx) }) {
+                            Text("授权日志目录", fontSize = 12.sp)
+                        }
+                    }
+                    TextButton(onClick = { refresh() }) { Text("刷新") }
+                }
+            }
+            if (!hasAllFilesAccess(ctx)) {
+                Text(
+                    "未授予「所有文件访问」，文件日志读不到，已自动切换为 logcat。",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
             Surface(
                 color = MaterialTheme.colorScheme.surfaceVariant,
                 shape = RoundedCornerShape(12.dp),
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(max = 320.dp),
+                    .heightIn(min = 140.dp, max = 380.dp),
             ) {
-                Text(
-                    text = content.ifBlank { "（空）" },
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 10.sp,
-                    modifier = Modifier
-                        .verticalScroll(rememberScrollState())
-                        .padding(10.dp),
-                )
+                Box {
+                    Text(
+                        text = if (loading) "读取中…" else content,
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 10.sp,
+                        modifier = Modifier
+                            .verticalScroll(rememberScrollState())
+                            .padding(10.dp),
+                    )
+                }
             }
+        }
+    }
+}
+
+/** 读 logcat 里本模块的输出（不需要权限） */
+private fun readLogcat(): String = runCatching {
+    val p = ProcessBuilder("logcat", "-d", "-t", "3000", "-s", "DragDropPlus:V")
+        .redirectErrorStream(true)
+        .start()
+    val out = p.inputStream.bufferedReader().readText()
+    p.waitFor()
+    // 只保留最近 8000 字符，避免超大
+    out.takeLast(8000).ifBlank { "（logcat 里暂无 DragDropPlus 输出）" }
+}.getOrDefault("（读 logcat 失败）")
+
+private fun hasAllFilesAccess(ctx: Context): Boolean = runCatching {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        android.os.Environment.isExternalStorageManager()
+    } else {
+        true
+    }
+}.getOrDefault(false)
+
+private fun requestAllFilesAccess(ctx: Context) {
+    runCatching {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val i = android.content.Intent(
+                android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                android.net.Uri.parse("package:" + ctx.packageName),
+            ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            ctx.startActivity(i)
+        }
+    }.onFailure {
+        runCatching {
+            ctx.startActivity(
+                android.content.Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+            )
         }
     }
 }

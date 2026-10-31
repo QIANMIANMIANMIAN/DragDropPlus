@@ -1,5 +1,6 @@
 package com.vivo.dragdrop.plus.xposed
 
+import android.content.Context
 import android.content.SharedPreferences
 import android.util.Log
 import io.github.libxposed.api.XposedModule
@@ -32,7 +33,14 @@ class HookEntry : XposedModule() {
         /** 调试日志 */
         const val KEY_DEBUG_LOG = "debug_log"
 
-        private const val LOG_DIR = "/sdcard/Documents/DragDropPlus"
+        /**
+         * 日志文件：
+         *  - 首选 App 私有目录（无需任何权限，管理器 UI 自己就能读）
+         *  - 尾部追加 /sdcard/Documents/DragDropPlus/ 副本（需要模块被授予「所有文件访问」）
+         *
+         * 1.0.0 只写 /sdcard/Documents，Android 11+ 下管理器 App 无权限读，
+         * 所以 UI 里显示「读取失败」。改成私有目录为主。
+         */
         private const val LOG_FILE = "module.log"
         private const val LOG_MAX_BYTES = 512L * 1024
     }
@@ -46,17 +54,19 @@ class HookEntry : XposedModule() {
     private var relaxImage: Boolean = false
 
     override fun onPackageLoaded(param: XposedModuleInterface.PackageLoadedParam) {
-        installFileLog()
+        val hostCl = param.defaultClassLoader
+
+        installFileLog(hostCl)
         reloadPrefs()
         installPrefsListener()
 
         ModLog.i("==== 模块加载 ====")
-        ModLog.i("pkg=${param.packageName} process=${param.isFirstPackage}")
+        ModLog.i("pkg=${param.packageName} first=${param.isFirstPackage}")
         ModLog.i("forceAll=$forceAll relaxImage=$relaxImage debug=${ModLog.debugEnabled}")
         ModLog.i("模块版本=${BuildConfigVersion.VERSION}")
 
         runCatching {
-            WhiteListHooker(this) { forceAll }.install()
+            WhiteListHooker(this, hostCl) { forceAll }.install()
         }.onFailure {
             ModLog.e("挂载失败", it)
         }
@@ -107,29 +117,71 @@ class HookEntry : XposedModule() {
 
     // ---------------- 文件日志 ----------------
 
-    private fun installFileLog() {
+    /**
+     * 日志落盘。
+     *
+     * 关键：目标进程里没有 Context 可用时，用宿主 ClassLoader 反射拿
+     * ActivityThread.currentApplication()；拿到后写它自己的私有目录
+     * （=/data/data/com.vivo.globaldragdrop/files/DragDropPlus/module.log）。
+     *
+     * 但管理器 App 读不到别的 App 的私有目录 —— 所以再尝试写一份到公共目录。
+     * 公共目录不可写就算了，UI 会提示去 logcat 看。
+     */
+    private fun installFileLog(hostCl: ClassLoader) {
         runCatching {
-            val dir = File(LOG_DIR)
+            val app = currentApplication(hostCl)
+            val dir = pickLogDir(app)
+            if (dir == null) {
+                ModLog.w("没有可写日志目录，只输出 logcat")
+                return
+            }
             if (!dir.exists()) dir.mkdirs()
             if (!dir.canWrite()) {
-                ModLog.w("日志目录不可写：$LOG_DIR")
+                ModLog.w("日志目录不可写：${dir.absolutePath}")
                 return
             }
             val file = File(dir, LOG_FILE)
-            // 简单滚动：超过上限就清空重来
-            if (file.exists() && file.length() > LOG_MAX_BYTES) {
-                file.delete()
-            }
+            if (file.exists() && file.length() > LOG_MAX_BYTES) file.delete()
+
+            // 公共目录副本（能写就写，写不了静默放弃）
+            val mirror = runCatching {
+                val d = File("/sdcard/Documents/DragDropPlus")
+                if (!d.exists()) d.mkdirs()
+                if (d.canWrite()) File(d, LOG_FILE) else null
+            }.getOrNull()
+
             val ts = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US)
             ModLog.install { line ->
-                runCatching {
-                    file.appendText("${ts.format(Date())} $line\n")
-                }
+                val text = "${ts.format(Date())} $line\n"
+                runCatching { file.appendText(text) }
+                mirror?.let { runCatching { it.appendText(text) } }
             }
+            ModLog.i("日志文件：${file.absolutePath}" + (mirror?.let { "（副本：${it.absolutePath}）" } ?: ""))
         }.onFailure {
             Log.w("DragDropPlus", "installFileLog failed", it)
         }
     }
+
+    private fun pickLogDir(app: Context?): File? {
+        if (app != null) {
+            runCatching {
+                return File(app.filesDir, "DragDropPlus")
+            }
+        }
+        // 没有 Context：退到外部公共目录（模块自身无存储权限，可能失败）
+        return runCatching {
+            val d = File("/sdcard/Documents/DragDropPlus")
+            if (!d.exists()) d.mkdirs()
+            d.takeIf { it.canWrite() }
+        }.getOrNull()
+    }
+
+    /** 用宿主 ClassLoader 反射取 Application Context（目标进程里没有别的办法拿到） */
+    private fun currentApplication(hostCl: ClassLoader): Context? = runCatching {
+        val at = Class.forName("android.app.ActivityThread", false, hostCl)
+        val cur = at.getMethod("currentApplication").invoke(null)
+        cur as? Context
+    }.getOrNull()
 }
 
 /** BuildConfig 在 xposed 进程里也可安全读取版本串 */
